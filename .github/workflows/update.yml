@@ -1,0 +1,65 @@
+name: Update RTK Banned IP List
+
+on:
+  schedule:
+    - cron: '0 4 * * *'  # Daily at 04:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Install sing-box
+        run: |
+          SINGBOX_TAG=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r .tag_name)
+          SINGBOX_VER="${SINGBOX_TAG#v}"
+          wget -q "https://github.com/SagerNet/sing-box/releases/download/${SINGBOX_TAG}/sing-box-${SINGBOX_VER}-linux-amd64.tar.gz"
+          tar xf "sing-box-${SINGBOX_VER}-linux-amd64.tar.gz"
+          sudo mv "sing-box-${SINGBOX_VER}-linux-amd64/sing-box" /usr/local/bin/
+
+      - name: Generate and compile
+        run: |
+          python3 generate.py
+          sing-box rule-set compile --output lt-banned.srs lt-banned-source.json
+
+      - name: Check for changes
+        id: diff
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          NEW=$(sha256sum lt-banned-source.json | cut -d' ' -f1)
+          OLD=$(gh release view --json body --jq '.body' 2>/dev/null \
+                | grep -oE 'src-hash: [a-f0-9]{64}' | awk '{print $2}' || echo "")
+          if [ "$NEW" = "$OLD" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create / replace dated release
+        if: steps.diff.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="v$(date -u +%Y-%m-%d)"
+          COUNT=$(python3 -c "import json; d=json.load(open('lt-banned-source.json')); print(len(d['rules'][0]['ip_cidr']))")
+          SRC_HASH=$(sha256sum lt-banned-source.json | cut -d' ' -f1)
+
+          gh release delete "$TAG" --yes 2>/dev/null || true
+          git push origin ":refs/tags/$TAG" 2>/dev/null || true
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag "$TAG"
+          git push origin "$TAG"
+
+          gh release create "$TAG" lt-banned.srs \
+            --title "RTK banned IPs $TAG" \
+            --notes "$(printf 'Source: https://www.rtk.lt/uploads/documents/files/atviri-duomenys/neteisetos-veiklos-vykdytojai/IP_adresu_sarasas.txt\n\nEntries: **%s** CIDR blocks (collapsed from raw list)\n\nsrc-hash: %s\n\n## Usage in podkop\n\n```\nhttps://github.com/${{ github.repository }}/releases/latest/download/lt-banned.srs\n```' "$COUNT" "$SRC_HASH")" \
+            --latest
